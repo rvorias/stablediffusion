@@ -20,9 +20,11 @@ def initialize_model(config, ckpt):
     config = OmegaConf.load(config)
     model = instantiate_from_config(config.model)
     model.load_state_dict(torch.load(ckpt)["state_dict"], strict=False)
-
+    print(model)
+    print(model.__dict__)
     device = torch.device(
         "cuda") if torch.cuda.is_available() else torch.device("cpu")
+    del model.depth_model
     model = model.to(device)
     sampler = DDIMSampler(model)
     return sampler
@@ -38,17 +40,28 @@ def make_batch_sd(
     image = np.array(image.convert("RGB"))
     image = torch.from_numpy(image).to(dtype=torch.float32) / 127.5 - 1.0
     # sample['jpg'] is tensor hwc in [-1, 1] at this point
-    midas_trafo = AddMiDaS(model_type=model_type)
+    # midas_trafo = AddMiDaS(model_type=model_type)
     batch = {
         "jpg": image,
         "txt": num_samples * [txt],
     }
-    batch = midas_trafo(batch)
+    # batch = midas_trafo(batch)
     batch["jpg"] = rearrange(batch["jpg"], 'h w c -> 1 c h w')
     batch["jpg"] = repeat(batch["jpg"].to(device=device),
                           "1 ... -> n ...", n=num_samples)
-    batch["midas_in"] = repeat(torch.from_numpy(batch["midas_in"][None, ...]).to(
-        device=device), "1 ... -> n ...", n=num_samples)
+    # batch["midas_in"] = repeat(torch.from_numpy(batch["midas_in"][None, ...]).to(
+    #     device=device), "1 ... -> n ...", n=num_samples)
+
+    # print("info about midas")
+    # print(type(batch["midas_in"]))
+    # print(batch["midas_in"].shape)
+    # print(batch["midas_in"].mean())
+    # print(batch["midas_in"].std())
+    # <class 'torch.Tensor'>
+    # torch.Size([1, 3, 384, 384])
+    # tensor(0.5823, device='cuda:0')
+    # tensor(0.1247, device='cuda:0')
+    
     return batch
 
 
@@ -59,11 +72,6 @@ def paint(sampler, image, prompt, t_enc, seed, scale, num_samples=1, callback=No
     model = sampler.model
     seed_everything(seed)
 
-    print("Creating invisible watermark encoder (see https://github.com/ShieldMnt/invisible-watermark)...")
-    wm = "SDV2"
-    wm_encoder = WatermarkEncoder()
-    wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
-
     with torch.no_grad(),\
             torch.autocast("cuda"):
         batch = make_batch_sd(
@@ -71,26 +79,35 @@ def paint(sampler, image, prompt, t_enc, seed, scale, num_samples=1, callback=No
         z = model.get_first_stage_encoding(model.encode_first_stage(
             batch[model.first_stage_key]))  # move to latent space
         c = model.cond_stage_model.encode(batch["txt"])
-        c_cat = list()
-        for ck in model.concat_keys:
-            cc = batch[ck]
-            cc = model.depth_model(cc)
-            depth_min, depth_max = torch.amin(cc, dim=[1, 2, 3], keepdim=True), torch.amax(cc, dim=[1, 2, 3],
-                                                                                           keepdim=True)
-            display_depth = (cc - depth_min) / (depth_max - depth_min)
-            depth_image = Image.fromarray(
-                (display_depth[0, 0, ...].cpu().numpy() * 255.).astype(np.uint8))
-            cc = torch.nn.functional.interpolate(
-                cc,
-                size=z.shape[2:],
-                mode="bicubic",
-                align_corners=False,
-            )
-            depth_min, depth_max = torch.amin(cc, dim=[1, 2, 3], keepdim=True), torch.amax(cc, dim=[1, 2, 3],
-                                                                                           keepdim=True)
-            cc = 2. * (cc - depth_min) / (depth_max - depth_min) - 1.
-            c_cat.append(cc)
-        c_cat = torch.cat(c_cat, dim=1)
+
+
+        cc = batch["jpg"][:,:1,...]
+        cc = torch.nn.functional.interpolate(
+            cc,
+            size=z.shape[2:],
+            mode="bicubic",
+            align_corners=False,
+        )
+        depth_min = torch.amin(cc, dim=[1, 2, 3], keepdim=True)
+        depth_max = torch.amax(cc, dim=[1, 2, 3], keepdim=True)
+        cc = 2. * (cc - depth_min) / (depth_max - depth_min) - 1.
+
+        print("info about cc")
+        print(type(cc))
+        print(cc.shape)
+        print(cc.mean())
+        print(cc.std())
+        # <class 'torch.Tensor'>
+        # torch.Size([1, 1, 64, 64])
+        # tensor(-0.2159, device='cuda:0', dtype=torch.float16)
+        # tensor(0.5161, device='cuda:0', dtype=torch.float16)
+        
+        c_cat = cc
+
+        print("info about ccc_cat")
+        print(c_cat.shape)
+        # torch.Size([1, 1, 64, 64])
+
         # cond
         cond = {"c_concat": [c_cat], "c_crossattn": [c]}
 
@@ -109,7 +126,7 @@ def paint(sampler, image, prompt, t_enc, seed, scale, num_samples=1, callback=No
         x_samples_ddim = model.decode_first_stage(samples)
         result = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
         result = result.cpu().numpy().transpose(0, 2, 3, 1) * 255
-    return [depth_image] + [put_watermark(Image.fromarray(img.astype(np.uint8)), wm_encoder) for img in result]
+    return [None] + [Image.fromarray(img.astype(np.uint8)) for img in result]
 
 
 def pad_image(input_image):
